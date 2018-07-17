@@ -60,3 +60,5 @@ services:
       - "5000:5000"
     extra_hosts:
       - "moby:127.0.0.1"
+    command:
+      - "pip install redis"
