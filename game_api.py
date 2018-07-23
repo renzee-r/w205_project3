@@ -13,6 +13,7 @@ def log_to_kafka(topic, event):
     event.update(request.headers)
     producer.send(topic, json.dumps(event).encode())
 
+
 def validate_session_login(username, event):
     if username is None:
         event.update({'return_code': '1'})
@@ -64,6 +65,24 @@ def buy_sword():
 
     log_to_kafka('events', buy_sword_event)
     return "Bought a Sword!\n"
+
+
+@app.route("/join_guild")
+def join_guild():
+    join_guild_event = {'event_type': 'join_guild'}
+    vsl_result = validate_session_login(request.args.get('username'), join_guild_event)
+
+    if vsl_result == 1:
+        return "Action Failed! Please provide a username.\n"
+    if vsl_result == 2:
+        return "Action Failed! This username does not exist. Please signup.\n"
+    if vsl_result == 3:
+        return "Action Failed! Your session has expired. Please login.\n"
+    if vsl_result == 4:
+        return "Action Failed! You do not have an active session on this machine. Please login.\n"
+
+    log_to_kafka('events', join_guild_event)
+    return "Joined a Guild!\n"
 
 
 @app.route("/login")
@@ -128,6 +147,7 @@ def signup():
     new_user_info['password'] = password
     new_user_info['session_datetime'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     new_user_info['session_host'] = request.headers['Host']
+    new_user_info['inventory'] = {'sword': 0, 'potion': 0, 'shield': 0}
     r.set(username, json.dumps(new_user_info))
 
     log_to_kafka('events', signup_event)
