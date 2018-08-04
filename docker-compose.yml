@@ -64,7 +64,7 @@ services:
       - "moby:127.0.0.1"
 
   mids:
-    image: midsw205/base:latest
+    image: midsw205/base:0.1.9
     stdin_open: true
     tty: true
     expose:

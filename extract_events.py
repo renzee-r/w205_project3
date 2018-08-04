@@ -5,12 +5,28 @@ import json
 from pyspark.sql import SparkSession, Row
 from pyspark.sql.functions import udf
 
-
-@udf('string')
-def munge_event(event_as_json):
+@udf('boolean')
+def is_item_event(event_as_json):
     event = json.loads(event_as_json)
-    event['Cache-Control'] = "no-cache"
-    return json.dumps(event)
+    if event['event_type'] == 'buy_sword':
+        return True
+    return False
+
+
+@udf('boolean')
+def is_guild_event(event_as_json):
+    event = json.loads(event_as_json)
+    if event['event_type'] == 'join_guild':
+        return True
+    return False
+
+
+@udf('boolean')
+def is_user_event(event_as_json):
+    event = json.loads(event_as_json)
+    if (event['event_type'] == 'signup') or (event['event_type'] == 'login'):
+        return True
+    return False
 
 
 def main():
@@ -30,15 +46,9 @@ def main():
         .option("endingOffsets", "latest") \
         .load()
 
-    munged_events = raw_events \
+    extracted_events = raw_events \
         .select(raw_events.value.cast('string').alias('raw'),
-                raw_events.timestamp.cast('string')) \
-        .withColumn('munged', munge_event('raw'))
-
-    extracted_events = munged_events \
-        .rdd \
-        .map(lambda r: Row(timestamp=r.timestamp, **json.loads(r.munged))) \
-        .toDF()
+                raw_events.timestamp.cast('string'))
 
     extracted_events.show()
 
@@ -49,7 +59,12 @@ def main():
 
     # Create a separate parquet file for item-based events
     item_events = extracted_events \
-        .filter(extracted_events.event_type == 'buy_sword')
+        .filter(is_item_event('raw'))
+
+    item_events = item_events \
+        .rdd \
+        .map(lambda r: Row(timestamp=r.timestamp, **json.loads(r.raw))) \
+        .toDF()
 
     item_events.show()
 
@@ -60,7 +75,12 @@ def main():
 
     # Create a parquet file for guild-based events
     guild_events = extracted_events \
-        .filter(extracted_events.event_type == 'join_guild')
+        .filter(is_guild_event('raw'))
+
+    guild_events = guild_events \
+        .rdd \
+        .map(lambda r: Row(timestamp=r.timestamp, **json.loads(r.raw))) \
+        .toDF()
 
     guild_events.show()
 
@@ -71,7 +91,12 @@ def main():
 
     # Create a parquet file for user-based events
     user_events = extracted_events \
-        .filter((extracted_events.event_type == 'signup') | (extracted_events.event_type == 'login'))
+        .filter(is_user_event('raw'))
+
+    user_events = user_events \
+        .rdd \
+        .map(lambda r: Row(timestamp=r.timestamp, **json.loads(r.raw))) \
+        .toDF()
 
     user_events.show()
 
