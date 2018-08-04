@@ -3,45 +3,90 @@ import json
 import redis
 from kafka import KafkaProducer
 from flask import Flask, request
+from functools import wraps
 from datetime import datetime
 from random import randint
 
 app = Flask(__name__)
 producer = KafkaProducer(bootstrap_servers='kafka:29092')
+
+# Instantiate redis. Redis will be used to store two types of entries:
+# Entry 1 (Username : User Information)
+#   Key:    The username of a registered user in our game
+#   Value:  A dict of various user information fields:
+#               password - The user's password for their account
+#               session_datetime - The date and time of their last active session
+#               inventory - A list of items that is in the user's inventory
+#
+# Entry 2 (SessionID : Username)
+#   Key:    The session ID of a currently active session in our game
+#   Value:  The username tied to the active session
 r = redis.Redis(host='redis', port='6379')
 
+# List of valid items within the game. This list is used to validate
+# buy actions, since the user can technically provide any string as a
+# parameter
 valid_items = ['sword', 'potion', 'shield']
+
+# List of used/stale session IDs. Used to ensure we do not assign
+# the same session ID twice.
 used_session_ids = []
 
+# Sends the event dict to kafka
 def log_to_kafka(topic, event):
     event.update(request.headers)
     producer.send(topic, json.dumps(event).encode())
 
 
-def validate_session_login(username, event):
-    if username is None:
-        event.update({'return_code': '1'})
-        return 1
+# Decorator that valides that the incoming request has a 
+# valid active session
+def validate_session(function_to_protect):
+    @wraps(function_to_protect)
+    def wrapper(*args, **kwargs):
+        # Get the session ID from the request cookies
+        session_id = request.cookies.get('session_id')
 
-    user_info_raw = r.get(username)
+        # Could not resolve the session ID. There was no valid cookie on the request.
+        if session_id is None:
+            return 'No active session found! Please login.\n'
 
-    if user_info_raw is None:
-        event.update({'return_code': '1'})
-        return 1
+        # Get the username associated with that session ID
+        username = r.get(session_id)
 
-    user_info = json.loads(user_info_raw)
+        # Could not resolve username. The session to user mapping was invalid.
+        if username is None:
+            return 'Invalid session! Please login.\n'
 
-    if user_info['session_datetime'] is None:
-        event.update({'return_code': '1'})
-        return 1
+        # Get the user information associated with that user
+        user_info_raw = r.get(username)
 
-    last_session_datetime = datetime.strptime(user_info['session_datetime'], "%Y-%m-%d %H:%M:%S")
+        # The username does not belong to a registered account. This error
+        # should never occur and would indicate some fatal condition within the game
+        if user_info_raw is None:
+            return 'Invalid username! Please login.\n'
 
-    if abs((datetime.now() - last_session_datetime).seconds) > 7200:
-        event.update({'return_code': '1'})
-        return 1
+        # Parse the raw user information into a dict
+        user_info = json.loads(user_info_raw)
+
+        # The user has never had an active session. This error should never
+        # occur and would indicate some fatal condition within the game
+        if user_info['session_datetime'] is None:
+            return  'Invalid user session! Please login.\n'
+
+        # The user was not active in the last 2 hours (or 7200 seconds). This
+        # would require the user to login again.
+        last_session_datetime = datetime.strptime(user_info['session_datetime'], "%Y-%m-%d %H:%M:%S")
+        if abs((datetime.now() - last_session_datetime).seconds) > 7200:
+            return 'Expired user session! Please login.\n'
+
+        # Successfully passed all validation checks
+        return function_to_protect(*args, **kwargs)
 
 
+    return wrapper
+
+
+# Default response, nothing special
 @app.route("/")
 def default_response():
     default_event = {'event_type': 'default'}
@@ -51,18 +96,20 @@ def default_response():
 
 
 @app.route("/buy/<item>")
+@validate_session
 def buy_item(item):
+    """Handles the purchasing of items for the user. First, purchasing items requires an
+    active session, which is validates through our validate_session decorator. The item being 
+    purchased is passed as a URL variable. If the item is not valid, the purchase will
+    fail. If the session and item is valid, the function will append the item to the user's
+    inventory. It will also refresh the user's session_datetime. Finally, log the event to kafka.
+    """
     buy_item_event = {'event_type': 'buy_item'}
 
+    # Get username from cookie and store it into the event. Don't
+    # need validation checks as it is all handled in the decorator
     session_id = request.cookies.get('session_id')
     username = r.get(session_id)
-
-    # Validate the username and session
-    vsl_result = validate_session_login(username, buy_item_event)
-    if vsl_result == 1:
-        return "Action Failed! You are not logged in. Please signup or login.\n"
-
-    # If username and session is valid, update the event with the username
     buy_item_event.update({'username': username})
 
     # Validate if the item is valid
@@ -70,13 +117,14 @@ def buy_item(item):
         return 'The store does not have that item in stock.'
 
     # If item is valid, update the event with the item. Also
-    # update the user's inventory.
+    # update the user's inventory and session_datetime
     buy_item_event.update({'item_type': item})
     user_info = json.loads(r.get(username))
     user_info['inventory'].append(item)
+    user_info['session_datetime'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     r.set(username, json.dumps(user_info))
 
-    # Upadte the vent with the latest inventory info
+    # Update the event with the latest inventory info
     buy_item_event.update({'inventory': user_info['inventory']})
 
     # TODO: Randomly generate the item quality
@@ -85,26 +133,43 @@ def buy_item(item):
     # TODO: Somehow attach the item quality to the items in 
     # user's inventory
 
+    # Send the even to kafka
     log_to_kafka('events', buy_item_event)
+
+    # Return a success message
     return 'Bought a ' + item + '!\n'
 
 
-@app.route("/join_guild")
-def join_guild():
+@app.route("/join_guild/<guild_name>")
+@validate_session
+def join_guild(guild_name):
+    """Handles the joining of guilds for the user. Joining a guild requires an
+    active session, which is validated by our validate_session decorator. The guild
+    being joined is passed as a URL variable. This action will refresh the user's 
+    session. It will then log the event to kafka.
+    """
     join_guild_event = {'event_type': 'join_guild'}
-    vsl_result = validate_session_login(request.args.get('username'), join_guild_event)
 
-    if vsl_result == 1:
-        return "Action Failed! Please provide a username.\n"
-    if vsl_result == 2:
-        return "Action Failed! This username does not exist. Please signup.\n"
-    if vsl_result == 3:
-        return "Action Failed! Your session has expired. Please login.\n"
-    if vsl_result == 4:
-        return "Action Failed! You do not have an active session on this machine. Please login.\n"
+    # Get username from cookie and store it into the event. Don't
+    # need validation checks as it is all handled in the decorator
+    session_id = request.cookies.get('session_id')
+    username = r.get(session_id)
+    buy_item_event.update({'username': username})
 
-    join_guild_event.update({'username': request.args.get('username')})
+    # Update the event with the name of the guild being joined
+    join_guild_event = {'guild_name': guild_name}
+
+    # Update the user's information with their new guild. Also
+    # refresh the user's session.
+    user_info = json.loads(r.get(username))
+    user_info['guild'] = guild_name
+    user_info['session_datetime'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    r.set(username, json.dumps(user_info))
+
+    # Send the event to kafka
     log_to_kafka('events', join_guild_event)
+
+    # Return a success message
     return "Joined a Guild!\n"
 
 
@@ -135,8 +200,11 @@ def login():
         login_event.update({'return_code': '1'})
         return "Login Failed! This password is incorrect.\n"
 
+    # TODO: Clear out any sessions currently tied to the user. Generate
+    # a new session and assign it the user
+
+    # Refresh the session datetime
     user_info['session_datetime'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    user_info['session_host'] = request.headers['Host']
     r.set(username, json.dumps(user_info))
 
     login_event.update({'user_info': user_info})
@@ -183,10 +251,8 @@ def signup():
 
     # Create new user info dict
     new_user_info = {}
-    new_user_info['username'] = username
     new_user_info['password'] = password
     new_user_info['session_datetime'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    new_user_info['session_host'] = request.headers['Host']
     new_user_info['inventory'] = []
 
     # Insert redis entry for the newly created user
@@ -201,22 +267,26 @@ def signup():
 
 @app.route("/status")
 def status():
-    status_event = {'event_type': 'status'}
+    users_str = 'Registered Users:\n'
+    sessions_str = 'Game Sessions:\n'
 
-    username = request.args.get('username')
+    for key in r.keys():
+        if key.isdigit():
+            username = r.get(key)
+            user_info = json.loads(r.get(username))
+            if user_info['session_datetime'] is None:
+                session_status = 'inactive'
+            elif abs((datetime.now() - datetime.strptime(user_info['session_datetime'], "%Y-%m-%d %H:%M:%S")).seconds) > 7200:
+                session_status = 'inactive'
+            else:
+                session_status = 'active'
 
-    # Validate the username and session
-    vsl_result = validate_session_login(username, status_event)
-    if vsl_result == 1:
-        return "Action Failed! Please provide a username.\n"
-    if vsl_result == 2:
-        return "Action Failed! This username does not exist. Please signup.\n"
-    if vsl_result == 3:
-        return "Action Failed! Your session has expired. Please login.\n"
-    if vsl_result == 4:
-        return "Action Failed! You do not have an active session on this machine. Please login.\n"
+            sessions_str += '\t' + key + ' : ' + username + ' (' + session_status + ')\n'
+        else:
+            users_str += '\t' + key + ' : ' + r.get(key) + '\n'
 
-    status_event.update({'user_info': json.loads(r.get(username))})
-    status_event.update({'return_code': '0'})
-    log_to_kafka('events', status_event)
-    return "Hello " + username + "!\n"
+            
+
+    
+    status_str = users_str + '\n' + sessions_str
+    return status_str
