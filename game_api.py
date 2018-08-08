@@ -154,10 +154,10 @@ def join_guild(guild_name):
     # need validation checks as it is all handled in the decorator
     session_id = request.cookies.get('session_id')
     username = r.get(session_id)
-    buy_item_event.update({'username': username})
+    join_guild_event.update({'username': username})
 
     # Update the event with the name of the guild being joined
-    join_guild_event = {'guild_name': guild_name}
+    join_guild_event.update({'guild_name': guild_name})
 
     # Update the user's information with their new guild. Also
     # refresh the user's session.
@@ -181,23 +181,19 @@ def login():
     password = request.args.get('password')
 
     if username is None:
-        login_event.update({'return_code': '1'})
         return "Login Failed! Please provide a username.\n"
 
     if password is None:
-        login_event.update({'return_code': '1'})
         return "Login Failed! Please provide a password.\n"
 
     user_info_raw = r.get(username)
 
     if user_info_raw is None:
-        login_event.update({'return_code': '1'})
         return "Login Failed! This username does not exist. Please signup.\n"
 
     user_info = json.loads(user_info_raw)
 
     if user_info['password'] != password:
-        login_event.update({'return_code': '1'})
         return "Login Failed! This password is incorrect.\n"
 
     # TODO: Clear out any sessions currently tied to the user. Generate
@@ -208,7 +204,6 @@ def login():
     r.set(username, json.dumps(user_info))
 
     login_event.update({'user_info': user_info})
-    login_event.update({'return_code': '0'})
     log_to_kafka('events', login_event)
     return "Login successful! Welcome " + username + ".\n"
 
