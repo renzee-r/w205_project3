@@ -24,7 +24,7 @@
 
 1) A summary type explanation of the example. 
 
-* We spin up a cluster of containers for kafka, zookeeper, spark, and our mids image. Then, on the mids container, we run our flask app. A change in the API server from last week is that the schema across different events is no longer standard. For example, 'buy' events now have a 'quality' column that is unique to those events. Another change is that we now use ApacheBench to generate our events. This gives us more flexibility in the event data we send over. To verify the data transfer, we use kafkacat on our mids container to read out the contents of our events topic. Similar to last week, we interact and write out the data through a spark script. The important modification since last week is to accomodate the varying schemas between different even types. So for this week, we filter the data to event type groups with similar schemas and write them out separately. We confirm that the files have been written to HDFS by performing a list directory. To ensure that the contents of the files are correct, we open a Jupyter notebook to inspect the parquet files. Happy with the results, we then spin down our cluster and cleanup the containers.
+* We spin up a cluster of containers for kafka, zookeeper, spark, mids, redis, presto, and cloudera images. On the mids container, we run our flask app. Our flask app acts as our game API server, accepting and processing game requests. The server has handlers for user events such as signing up and logging in, a handler for buying an item, a handler for joining a guild, and other administrative handlers. At this point, the game can handle any input of items or guild names passed as URL parameters. The user's in-game information is stored in Redis, keeping track of their guild and their inventory. The user's game session is tracked through client-side cookies, that are also maintained in Redis. After handling the in-game logic, the game API server will send the event data to our Kafka server. We then have spark scripts that initiates a read/write stream that reads the Kafka logs and writes them out to parquet files in HDFS. There is a spark script for each event type; buy events, guild events, and user events. Each spark script is responsible for defining the schema, filtering to only the specified event type, appending metadata, and writing the a specified HDFS directory. We can then declare the schema of the datatables in Hive and point them to our parquet files to make our data queryable from Presto. We test out this entire pipeline by looping a set of Apache Bench commands that constantly send buy requests to our game API server. We then run our spark streaming job to intake the requests coming into Kafka and write them into HDFS. With data in HDFS, we setup our Hive metastore containing the schema for our buy events and pointing to the parquet files. We finally test out some queries in Presto to ensure everything is working as expected. Happy with the results, we then spin everything down.
 
 
 2) Your `docker-compose.yml`
@@ -66,31 +66,47 @@
           - "moby:127.0.0.1"
 
       cloudera:
-        image: midsw205/cdh-minimal:latest
+        image: midsw205/hadoop:0.0.2
+        hostname: cloudera
         expose:
           - "8020" # nn
-          - "50070" # nn http
           - "8888" # hue
-        #ports:
-        #- "8888:8888"
+          - "9083" # hive thrift
+          - "10000" # hive jdbc
+          - "50070" # nn http
+        ports:
+          - "8888:8888"
         extra_hosts:
           - "moby:127.0.0.1"
 
       spark:
-        image: midsw205/spark-python:0.0.5
+        image: midsw205/spark-python:0.0.6
         stdin_open: true
         tty: true
+        volumes:
+          - ~/w205:/w205
         expose:
           - "8888"
         ports:
-          - "8888:8888"
-        volumes:
-          - "~/w205:/w205"
-        command: bash
+          - "8889:8888" # 8888 conflicts with hue
         depends_on:
           - cloudera
         environment:
           HADOOP_NAMENODE: cloudera
+          HIVE_THRIFTSERVER: cloudera:9083
+        extra_hosts:
+          - "moby:127.0.0.1"
+        command: bash
+
+      presto:
+        image: midsw205/presto:0.0.1
+        hostname: presto
+        volumes:
+          - ~/w205:/w205
+        expose:
+          - "8080"
+        environment:
+          HIVE_THRIFTSERVER: cloudera:9083
         extra_hosts:
           - "moby:127.0.0.1"
 
@@ -98,14 +114,15 @@
         image: midsw205/base:0.1.9
         stdin_open: true
         tty: true
+        volumes:
+          - ~/w205:/w205
         expose:
           - "5000"
         ports:
           - "5000:5000"
-        volumes:
-          - "~/w205:/w205"
         extra_hosts:
           - "moby:127.0.0.1"
+
 
 
 3) Source code for the flask application(s) used.
@@ -117,86 +134,173 @@
         import redis
         from kafka import KafkaProducer
         from flask import Flask, request
+        from functools import wraps
         from datetime import datetime
+        from random import randint
 
         app = Flask(__name__)
         producer = KafkaProducer(bootstrap_servers='kafka:29092')
+
+        # Instantiate redis. Redis will be used to store two types of entries:
+        # Entry 1 (Username : User Information)
+        #   Key:    The username of a registered user in our game
+        #   Value:  A dict of various user information fields:
+        #               password - The user's password for their account
+        #               session_datetime - The date and time of their last active session
+        #               inventory - A list of items that is in the user's inventory
+        #
+        # Entry 2 (SessionID : Username)
+        #   Key:    The session ID of a currently active session in our game
+        #   Value:  The username tied to the active session
         r = redis.Redis(host='redis', port='6379')
 
+        # List of valid items within the game. This list is used to validate
+        # buy actions, since the user can technically provide any string as a
+        # parameter
+        valid_items = ['sword', 'potion', 'shield']
+
+        # List of used/stale session IDs. Used to ensure we do not assign
+        # the same session ID twice.
+        used_session_ids = []
+
+        # Sends the event dict to kafka
         def log_to_kafka(topic, event):
             event.update(request.headers)
             producer.send(topic, json.dumps(event).encode())
 
 
-        def validate_session_login(username, event):
-            if username is None:
-                event.update({'return_code': '1'})
-                return 1
+        # Decorator that valides that the incoming request has a 
+        # valid active session
+        def validate_session(function_to_protect):
+            @wraps(function_to_protect)
+            def wrapper(*args, **kwargs):
+                # Get the session ID from the request cookies
+                session_id = request.cookies.get('session_id')
 
-            user_info_raw = r.get(username)
+                # Could not resolve the session ID. There was no valid cookie on the request.
+                if session_id is None:
+                    return 'No active session found! Please login.\n'
 
-            if user_info_raw is None:
-                event.update({'return_code': '1'})
-                return 2
+                # Get the username associated with that session ID
+                username = r.get(session_id)
 
-            user_info = json.loads(user_info_raw)
+                # Could not resolve username. The session to user mapping was invalid.
+                if username is None:
+                    return 'Invalid session! Please login.\n'
 
-            if user_info['session_datetime'] is None:
-                event.update({'return_code': '1'})
-                return 4
+                # Get the user information associated with that user
+                user_info_raw = r.get(username)
 
-            last_session_datetime = datetime.strptime(user_info['session_datetime'], "%Y-%m-%d %H:%M:%S")
+                # The username does not belong to a registered account. This error
+                # should never occur and would indicate some fatal condition within the game
+                if user_info_raw is None:
+                    return 'Invalid username! Please login.\n'
 
-            if abs((datetime.now() - last_session_datetime).seconds) > 7200:
-                event.update({'return_code': '1'})
-                return 3
+                # Parse the raw user information into a dict
+                user_info = json.loads(user_info_raw)
 
-            if user_info['session_host'] != request.headers['Host']:
-                event.update({'return_code': '1'})
-                return 4
+                # The user has never had an active session. This error should never
+                # occur and would indicate some fatal condition within the game
+                if user_info['session_datetime'] is None:
+                    return  'Invalid user session! Please login.\n'
+
+                # The user was not active in the last 2 hours (or 7200 seconds). This
+                # would require the user to login again.
+                last_session_datetime = datetime.strptime(user_info['session_datetime'], "%Y-%m-%d %H:%M:%S")
+                if abs((datetime.now() - last_session_datetime).seconds) > 7200:
+                    return 'Expired user session! Please login.\n'
+
+                # Successfully passed all validation checks
+                return function_to_protect(*args, **kwargs)
 
 
+            return wrapper
+
+
+        # Default response, nothing special
         @app.route("/")
         def default_response():
             default_event = {'event_type': 'default'}
             log_to_kafka('events', default_event)
+
             return "This is the default response!\n"
 
 
-        @app.route("/buy_sword")
-        def buy_sword():
-            buy_sword_event = {'event_type': 'buy_sword'}
-            buy_sword_event.update({'item_quality': 'common'})
-            vsl_result = validate_session_login(request.args.get('username'), buy_sword_event)
+        @app.route("/buy/<item>")
+        @validate_session
+        def buy_item(item):
+            """Handles the purchasing of items for the user. First, purchasing items requires an
+            active session, which is validates through our validate_session decorator. The item being 
+            purchased is passed as a URL variable. If the item is not valid, the purchase will
+            fail. If the session and item is valid, the function will append the item to the user's
+            inventory. It will also refresh the user's session_datetime. Finally, log the event to kafka.
+            """
+            buy_item_event = {'event_type': 'buy_item'}
 
-            if vsl_result == 1:
-                return "Action Failed! Please provide a username.\n"
-            if vsl_result == 2:
-                return "Action Failed! This username does not exist. Please signup.\n"
-            if vsl_result == 3:
-                return "Action Failed! Your session has expired. Please login.\n"
-            if vsl_result == 4:
-                return "Action Failed! You do not have an active session on this machine. Please login.\n"
+            # Get username from cookie and store it into the event. Don't
+            # need validation checks as it is all handled in the decorator
+            session_id = request.cookies.get('session_id')
+            username = r.get(session_id)
+            buy_item_event.update({'username': username})
 
-            log_to_kafka('events', buy_sword_event)
-            return "Bought a Sword!\n"
+            # Validate if the item is valid
+            if item not in valid_items:
+                return 'The store does not have that item in stock.'
+
+            # If item is valid, update the event with the item. Also
+            # update the user's inventory and session_datetime
+            buy_item_event.update({'item_type': item})
+            user_info = json.loads(r.get(username))
+            user_info['inventory'].append(item)
+            user_info['session_datetime'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            r.set(username, json.dumps(user_info))
+
+            # Update the event with the latest inventory info
+            buy_item_event.update({'inventory': user_info['inventory']})
+
+            # TODO: Randomly generate the item quality
+            buy_item_event.update({'item_quality': 'common'})
+
+            # TODO: Somehow attach the item quality to the items in 
+            # user's inventory
+
+            # Send the even to kafka
+            log_to_kafka('events', buy_item_event)
+
+            # Return a success message
+            return 'Bought a ' + item + '!\n'
 
 
-        @app.route("/join_guild")
-        def join_guild():
+        @app.route("/join_guild/<guild_name>")
+        @validate_session
+        def join_guild(guild_name):
+            """Handles the joining of guilds for the user. Joining a guild requires an
+            active session, which is validated by our validate_session decorator. The guild
+            being joined is passed as a URL variable. This action will refresh the user's 
+            session. It will then log the event to kafka.
+            """
             join_guild_event = {'event_type': 'join_guild'}
-            vsl_result = validate_session_login(request.args.get('username'), join_guild_event)
 
-            if vsl_result == 1:
-                return "Action Failed! Please provide a username.\n"
-            if vsl_result == 2:
-                return "Action Failed! This username does not exist. Please signup.\n"
-            if vsl_result == 3:
-                return "Action Failed! Your session has expired. Please login.\n"
-            if vsl_result == 4:
-                return "Action Failed! You do not have an active session on this machine. Please login.\n"
+            # Get username from cookie and store it into the event. Don't
+            # need validation checks as it is all handled in the decorator
+            session_id = request.cookies.get('session_id')
+            username = r.get(session_id)
+            join_guild_event.update({'username': username})
 
+            # Update the event with the name of the guild being joined
+            join_guild_event.update({'guild_name': guild_name})
+
+            # Update the user's information with their new guild. Also
+            # refresh the user's session.
+            user_info = json.loads(r.get(username))
+            user_info['guild'] = guild_name
+            user_info['session_datetime'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            r.set(username, json.dumps(user_info))
+
+            # Send the event to kafka
             log_to_kafka('events', join_guild_event)
+
+            # Return a success message
             return "Joined a Guild!\n"
 
 
@@ -208,30 +312,29 @@
             password = request.args.get('password')
 
             if username is None:
-                login_event.update({'return_code': '1'})
                 return "Login Failed! Please provide a username.\n"
 
             if password is None:
-                login_event.update({'return_code': '1'})
                 return "Login Failed! Please provide a password.\n"
 
             user_info_raw = r.get(username)
 
             if user_info_raw is None:
-                login_event.update({'return_code': '1'})
                 return "Login Failed! This username does not exist. Please signup.\n"
 
             user_info = json.loads(user_info_raw)
 
             if user_info['password'] != password:
-                login_event.update({'return_code': '1'})
                 return "Login Failed! This password is incorrect.\n"
 
+            # TODO: Clear out any sessions currently tied to the user. Generate
+            # a new session and assign it the user
+
+            # Refresh the session datetime
             user_info['session_datetime'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            user_info['session_host'] = request.headers['Host']
             r.set(username, json.dumps(user_info))
 
-            login_event.update({'return_code': '0'})
+            login_event.update({'user_info': user_info})
             log_to_kafka('events', login_event)
             return "Login successful! Welcome " + username + ".\n"
 
@@ -257,32 +360,292 @@
                 signup_event.update({'return_code': '1'})
                 return "Signup Failed! This username already exists.\n"
 
+            # Build our response message
+            response = app.make_response('Signup successful! Welcome ' + username + '.\n')
+            
+            # Generate the session ID. Ensure that the session ID is not already
+            # in use
+            session_id = randint(10000, 99999)
+            while (session_id in used_session_ids):
+                session_id = randint(10000, 99999)
+
+            # Attach a cookie containing the session ID to the response
+            response.set_cookie('session_id', str(session_id))
+
+            # Insert a redis entry linking the session_id and the username
+            r.set(session_id, username)
+
+            # Create new user info dict
             new_user_info = {}
-            new_user_info['username'] = username
             new_user_info['password'] = password
             new_user_info['session_datetime'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            new_user_info['session_host'] = request.headers['Host']
-            new_user_info['inventory'] = {'sword': 0, 'potion': 0, 'shield': 0}
+            new_user_info['inventory'] = []
+
+            # Insert redis entry for the newly created user
             r.set(username, json.dumps(new_user_info))
 
+            signup_event.update({'user_info': new_user_info})
+            signup_event.update({'return_code': '0'})
             log_to_kafka('events', signup_event)
-            return "Signup successful! Welcome " + username + ".\n"
+            return response
+            #"Signup successful! Welcome " + username + ".\n"
+
+
+        @app.route("/status")
+        def status():
+            users_str = 'Registered Users:\n'
+            sessions_str = 'Game Sessions:\n'
+
+            for key in r.keys():
+                if key.isdigit():
+                    username = r.get(key)
+                    user_info = json.loads(r.get(username))
+                    if user_info['session_datetime'] is None:
+                        session_status = 'inactive'
+                    elif abs((datetime.now() - datetime.strptime(user_info['session_datetime'], "%Y-%m-%d %H:%M:%S")).seconds) > 7200:
+                        session_status = 'inactive'
+                    else:
+                        session_status = 'active'
+
+                    sessions_str += '\t' + key + ' : ' + username + ' (' + session_status + ')\n'
+                else:
+                    users_str += '\t' + key + ' : ' + r.get(key) + '\n'
+
+                    
+
+            
+            status_str = users_str + '\n' + sessions_str
+            return status_str
   
-  * extract_events.py
+  * stream_buy_events.py
 
         #!/usr/bin/env python
         """Extract events from kafka and write them to hdfs
         """
         import json
         from pyspark.sql import SparkSession, Row
-        from pyspark.sql.functions import udf
+        from pyspark.sql.functions import udf, from_json
+        from pyspark.sql.types import StructType, StructField, StringType, ArrayType
+
+        def buy_event_schema():
+            """
+            root
+            |-- Accept: string (nullable = true)
+            |-- Host: string (nullable = true)
+            |-- User-Agent: string (nullable = true)
+            |-- event_type: string (nullable = true)
+            |-- username: string (nullable = true)
+            |-- item_type: string (nullable = true)
+            |-- Cookie: string (nullable = true)
+            |-- item_quality: string (nullable = true)
+            |-- user_info: Struct (nullable = true)
+            |-- timestamp: string (nullable = true)
+            """
+            return StructType([
+                StructField("Accept", StringType(), True),
+                StructField("Host", StringType(), True),
+                StructField("User-Agent", StringType(), True),
+                StructField("event_type", StringType(), True),
+                StructField("username", StringType(), True),
+                StructField("item_type", StringType(), True),
+                StructField("Cookie", StringType(), True),
+                StructField("item_quality", StringType(), True),
+                StructField("user_info", user_info_schema(), True),
+            ])
 
 
-        @udf('string')
-        def munge_event(event_as_json):
+        def user_info_schema():
+            """
+            root
+            |-- password: string (nullable = true)
+            |-- session_datetime: string (nullable = true)
+            |-- inventory: array (nullable = true)
+            """
+            return StructType([
+                StructField("password", StringType(), True),
+                StructField("session_datetime", StringType(), True),
+                StructField("inventory", ArrayType(StringType()), True),
+            ])
+
+
+        @udf('boolean')
+        def is_buy_event(event_as_json):
             event = json.loads(event_as_json)
-            event['Cache-Control'] = "no-cache"
-            return json.dumps(event)
+            if event['event_type'] == 'buy_item':
+                return True
+            return False
+
+
+        def main():
+            """main
+            """
+            spark = SparkSession \
+                .builder \
+                .appName("StreamBuyEventsJob") \
+                .getOrCreate()
+
+            raw_events = spark \
+                .readStream \
+                .format("kafka") \
+                .option("kafka.bootstrap.servers", "kafka:29092") \
+                .option("subscribe", "events") \
+                .load()
+
+            # Create a stream for buy events
+            buy_events = raw_events \
+                .filter(is_buy_event(raw_events.value.cast('string'))) \
+                .select(raw_events.value.cast('string').alias('raw_event'),
+                        raw_events.timestamp.cast('string'),
+                        from_json(raw_events.value.cast('string'),
+                                  buy_event_schema()).alias('json')) \
+                .select('raw_event', 'timestamp', 'json.*')
+
+            sink = buy_events \
+                .writeStream \
+                .format("parquet") \
+                .option("checkpointLocation", "/tmp/checkpoints_buy_events") \
+                .option("path", "/tmp/events_buy") \
+                .trigger(processingTime="10 seconds") \
+                .start()
+
+            sink.awaitTermination()
+
+
+        if __name__ == "__main__":
+            main()
+
+    * stream_guild_events.py
+
+        #!/usr/bin/env python
+        """Extract events from kafka and write them to hdfs
+        """
+        import json
+        from pyspark.sql import SparkSession, Row
+        from pyspark.sql.functions import udf, from_json
+        from pyspark.sql.types import StructType, StructField, StringType
+
+
+        def guild_event_schema():
+            """
+            root
+            |-- Accept: string (nullable = true)
+            |-- Host: string (nullable = true)
+            |-- User-Agent: string (nullable = true)
+            |-- event_type: string (nullable = true)
+            |-- username: string (nullable = true)
+            |-- Cookie: string (nullable = true)
+            |-- guild_name: string (nullable = true)
+            |-- timestamp: string (nullable = true)
+            """
+            return StructType([
+                StructField("Accept", StringType(), True),
+                StructField("Host", StringType(), True),
+                StructField("User-Agent", StringType(), True),
+                StructField("event_type", StringType(), True),
+                StructField("username", StringType(), True),
+                StructField("Cookie", StringType(), True),
+                StructField("guild_name", StringType(), True),
+            ])
+
+
+        @udf('boolean')
+        def is_guild_event(event_as_json):
+            event = json.loads(event_as_json)
+            if event['event_type'] == 'join_guild':
+                return True
+            return False
+
+
+        def main():
+            """main
+            """
+            spark = SparkSession \
+                .builder \
+                .appName("StreamGuildEventsJob") \
+                .getOrCreate()
+
+            raw_events = spark \
+                .readStream \
+                .format("kafka") \
+                .option("kafka.bootstrap.servers", "kafka:29092") \
+                .option("subscribe", "events") \
+                .load()
+
+            # Create a stream for guild events
+            guild_events = raw_events \
+                .filter(is_guild_event(raw_events.value.cast('string'))) \
+                .select(raw_events.value.cast('string').alias('raw_event'),
+                        raw_events.timestamp.cast('string'),
+                        from_json(raw_events.value.cast('string'),
+                                  guild_event_schema()).alias('json')) \
+                .select('raw_event', 'timestamp', 'json.*')
+
+            sink = guild_events \
+                .writeStream \
+                .format("parquet") \
+                .option("checkpointLocation", "/tmp/checkpoints_guild_events") \
+                .option("path", "/tmp/events_guild") \
+                .trigger(processingTime="10 seconds") \
+                .start()
+
+            sink.awaitTermination()
+
+
+        if __name__ == "__main__":
+            main()
+
+    * stream_user_events.py
+
+        #!/usr/bin/env python
+        """Extract events from kafka and write them to hdfs
+        """
+        import json
+        from pyspark.sql import SparkSession, Row
+        from pyspark.sql.functions import udf, from_json
+        from pyspark.sql.types import StructType, StructField, StringType, ArrayType
+
+
+        def user_event_schema():
+            """
+            root
+            |-- Accept: string (nullable = true)
+            |-- Host: string (nullable = true)
+            |-- User-Agent: string (nullable = true)
+            |-- event_type: string (nullable = true)
+            |-- user_info: Struct (nullable = true)
+            |-- Cookie: string (nullable = true)
+            |-- timestamp: string (nullable = true)
+            """
+            return StructType([
+                StructField("Accept", StringType(), True),
+                StructField("Host", StringType(), True),
+                StructField("User-Agent", StringType(), True),
+                StructField("event_type", StringType(), True),
+                StructField("user_info", user_info_schema(), True),
+                StructField("Cookie", StringType(), True),
+            ])
+
+
+        def user_info_schema():
+            """
+            root
+            |-- password: string (nullable = true)
+            |-- session_datetime: string (nullable = true)
+            |-- inventory: array (nullable = true)
+            """
+            return StructType([
+                StructField("password", StringType(), True),
+                StructField("session_datetime", StringType(), True),
+                StructField("inventory", ArrayType(StringType()), True),
+            ])
+
+
+        @udf('boolean')
+        def is_user_event(event_as_json):
+            event = json.loads(event_as_json)
+            if (event['event_type'] == 'signup') or (event['event_type'] == 'login'):
+                return True
+            return False
 
 
         def main():
@@ -294,248 +657,358 @@
                 .getOrCreate()
 
             raw_events = spark \
-                .read \
+                .readStream \
                 .format("kafka") \
                 .option("kafka.bootstrap.servers", "kafka:29092") \
                 .option("subscribe", "events") \
-                .option("startingOffsets", "earliest") \
-                .option("endingOffsets", "latest") \
                 .load()
 
-            munged_events = raw_events \
-                .select(raw_events.value.cast('string').alias('raw'),
-                        raw_events.timestamp.cast('string')) \
-                .withColumn('munged', munge_event('raw'))
+            # Create a stream for user events
+            user_events = raw_events \
+                .filter(is_user_event(raw_events.value.cast('string'))) \
+                .select(raw_events.value.cast('string').alias('raw_event'),
+                        raw_events.timestamp.cast('string'),
+                        from_json(raw_events.value.cast('string'),
+                                  user_event_schema()).alias('json')) \
+                .select('raw_event', 'timestamp', 'json.*')
 
-            extracted_events = munged_events \
-                .rdd \
-                .map(lambda r: Row(timestamp=r.timestamp, **json.loads(r.munged))) \
-                .toDF()
+            sink = user_events \
+                .writeStream \
+                .format("parquet") \
+                .option("checkpointLocation", "/tmp/checkpoints_user_events") \
+                .option("path", "/tmp/events_user") \
+                .trigger(processingTime="10 seconds") \
+                .start()
 
-            extracted_events \
-                .write \
-                .parquet("/tmp/events_all")
-
-            # Create a separate parquet file for item-based events
-            item_events = extracted_events \
-                .filter(extracted_events.event_type == 'buy_sword')
-            item_events.show()
-
-            item_events \
-                .write \
-                .mode("overwrite") \
-                .parquet("/tmp/events_item")
-
-            # Create a parquet file for guild-based events
-            guild_events = extracted_events \
-                .filter(extracted_events.event_type == 'join_guild')
-            guild_events.show()
-
-            guild_events \
-                .write \
-                .mode("overwrite") \
-                .parquet("/tmp/events_guild")
-
-            # Create a parquet file for user-based events
-            user_events = extracted_events \
-                .filter(extracted_events.event_type == 'signup' or extracted_events.event_type == 'login')
-            user_events.show()
-
-            user_events \
-                .write \
-                .mode("overwrite") \
-                .parquet("/tmp/events_user")
+            sink.awaitTermination()
 
 
         if __name__ == "__main__":
             main()
 
 
-4) Each important step in the process. For each step, include:
+
+4) Each important step in the process:
 	
-* Command: `docker-compose up -d`
-    * Output:
+## docker-compose up -d
+Output:
 
-	    	Creating network "assignment11renzeer_default" with the default driver
-            Creating assignment11renzeer_mids_1
-            Creating assignment11renzeer_cloudera_1
-            Creating assignment11renzeer_redis_1
-            Creating assignment11renzeer_zookeeper_1
-            Creating assignment11renzeer_kafka_1
-            Creating assignment11renzeer_spark_1
+	Creating network "assignment12renzeer_default" with the default driver
+    Creating assignment12renzeer_cloudera_1
+    Creating assignment12renzeer_redis_1
+    Creating assignment12renzeer_mids_1
+    Creating assignment12renzeer_zookeeper_1
+    Creating assignment12renzeer_presto_1
+    Creating assignment12renzeer_kafka_1
+    Creating assignment12renzeer_spark_1
 
-    * Result: This spins up our cluster of containers as specified by our docker-compose yaml file. This includes our kafka, zookeeper, spark, and mids containers.
+Result:  
+This spins up our cluster of containers as specified by our docker-compose yaml file. This includes our kafka, zookeeper, spark, mids, cloudera, redis, and presto containers.
 
-* Command: `docker-compose ps`
-    * Output:
+## docker-compose ps
+Output:
 
-            Name                            Command               State                                         Ports                                        
-            -------------------------------------------------------------------------------------------------------------------------------------------------------------
-            assignment11renzeer_cloudera_1    cdh_startup_script.sh            Up      11000/tcp, 11443/tcp, 19888/tcp, 50070/tcp, 8020/tcp, 8088/tcp, 8888/tcp, 9090/tcp 
-            assignment11renzeer_kafka_1       /etc/confluent/docker/run        Up      29092/tcp, 9092/tcp                                                                
-            assignment11renzeer_mids_1        /bin/bash                        Up      0.0.0.0:5000->5000/tcp, 8888/tcp                                                   
-            assignment11renzeer_redis_1       docker-entrypoint.sh redis ...   Up      6379/tcp                                                                           
-            assignment11renzeer_spark_1       docker-entrypoint.sh bash        Up      0.0.0.0:8888->8888/tcp                                                             
-            assignment11renzeer_zookeeper_1   /etc/confluent/docker/run        Up      2181/tcp, 2888/tcp, 32181/tcp, 3888/tcp   
+    Name                            Command               State                                Ports                               
+    -------------------------------------------------------------------------------------------------------------------------------------------
+    assignment12renzeer_cloudera_1    /usr/bin/docker-entrypoint ...   Up      10000/tcp, 50070/tcp, 8020/tcp, 0.0.0.0:8888->8888/tcp, 9083/tcp 
+    assignment12renzeer_kafka_1       /etc/confluent/docker/run        Up      29092/tcp, 9092/tcp                                              
+    assignment12renzeer_mids_1        /bin/bash                        Up      0.0.0.0:5000->5000/tcp, 8888/tcp                                 
+    assignment12renzeer_presto_1      /usr/bin/docker-entrypoint ...   Up      8080/tcp                                                         
+    assignment12renzeer_redis_1       docker-entrypoint.sh redis ...   Up      6379/tcp                                                         
+    assignment12renzeer_spark_1       docker-entrypoint.sh bash        Up      0.0.0.0:8889->8888/tcp                                           
+    assignment12renzeer_zookeeper_1   /etc/confluent/docker/run        Up      2181/tcp, 2888/tcp, 32181/tcp, 3888/tcp   
 
-    * Result: Confirming that all of our containers are up and running.
+Result:  
+Confirming that all of our containers are up and running.
 
-* Command: `docker-compose exec kafka kafka-topics --create --topic events --partitions 1 --replication-factor 1 --if-not-exists --zookeeper zookeeper:32181`
-    * Output:
+## docker-compose exec kafka kafka-topics --create --topic events --partitions 1 --replication-factor 1 --if-not-exists --zookeeper zookeeper:32181
+Output:
 
-    		Created topic "events".
+    Created topic "events".
 
-    * Result: Create a topic named events within our kafka server. Specify that this topic only have 1 partition, use a replication factor of 1, and create only if it does not already exist. Also specify the zookeeper connection. 
+Result:  
+Create a topic named events within our kafka server. Specify that this topic only have 1 partition, use a replication factor of 1, and create only if it does not already exist. Also specify the zookeeper connection. 
 
-* Command: `docker-compose exec mids env FLASK_APP=/w205/full-stack/game_api.py flask run --host 0.0.0.0`
-    * Output:
+## docker-compose exec mids bash -c 'pip install redis'
+Output:
 
-			* Serving Flask app "game_api"
-			* Running on http://127.0.0.1:5000/ (Press CTRL+C to quit)
+    Collecting redis
+      Downloading https://files.pythonhosted.org/packages/3b/f6/7a76333cf0b9251ecf49efff635015171843d9b977e4ffcf59f9c4428052/redis-2.10.6-py2.py3-none-any.whl (64kB)
+        100% |################################| 71kB 4.1MB/s 
+    Installing collected packages: redis
+    Successfully installed redis-2.10.6
 
-    * Result: Run the flask app on the mids container. Use the code from game_api.py, which contains our server handlers for the default response, /buy_sword, /join_guild, /signup, and /login. With the addition of tracking user sessions, all actions now require the request to specify the user and for that user to be logged in. These responses will send a message to our kafka server and print out a success message. 
+Result:  
+Our latest game server code utilizes redis to store game data. Redis is not installed by default on our mids container, so we will need to install it. 
 
-* Command: `docker-compose exec mids curl http://localhost:5000/`
-    * Client Output:
+## docker-compose exec mids env FLASK_APP=/w205/assignment-12-renzee-r/game_api.py flask run --host 0.0.0.0
+Output:
 
-    		This is the default response!
+	* Serving Flask app "game_api"
+	* Running on http://127.0.0.1:5000/ (Press CTRL+C to quit)
 
-    * API Server Output:
+Result:  
+Run the flask app on the mids container. Use the code from game_api.py, which contains our server handlers for the default response, buying items, joining a guild, and user actions. There have been various changes to the games server code, which will be covered in the following commands that send requests to the flask app.
 
-    		127.0.0.1 - - [19/Jul/2018 20:31:40] "GET / HTTP/1.1" 200 -
+## curl -c /tmp/cookies -b /tmp/cookies 'http://localhost:5000/signup?username=user1&password=pw1'
+Client Output:
 
-    * Result: Send a URL request to our API server for the default response on the mids container. This will print out a success message on the client and also send the event to our kafka server. We should also see the incoming request in our API server logs.
+	Signup successful! Welcome user1.
 
-* Command: `docker-compose exec mids curl http://localhost:5000/buy_sword?username=renzeer`
-    * Client Output:
+API Server Output:
 
-    		Action Failed! This username does not exist. Please signup.
+	172.18.0.1 - - [12/Aug/2018 23:22:06] "GET /signup?username=user1&password=pw1 HTTP/1.1" 200 -
 
-    * API Server Output:
+Result:  
+Send a URL request to our API server for /signup on the mids container. This creates the user user1 inside of our game. User data is stored as a redis entry. A new change is that this action will also generate a session ID and tie it to the newly created user. The session ID is also stored as a cookie on the requesting client as a way to maintain active game sessions. All in-game actions require an active session cookie. Otherwise, the game will prompt the user to login.
 
-    		127.0.0.1 - - [19/Jul/2018 20:31:43] "GET /buy_sword?username=renzeer HTTP/1.1" 200 -
+## curl -c /tmp/cookies -b /tmp/cookies http://localhost:5000/status
+Client Output:
 
-    * Result: Send a URL request to our API server for /buy_sword on the mids container. Since I have not registered the username renzeer in our game, the action fails. No event is logged to kafka in the event of a failed action.
+    Registered Users:
+        user1 : {"password": "pw1", "session_datetime": "2018-08-13 02:16:20", "inventory": []}
 
-* Command: `docker-compose exec mids curl 'http://localhost:5000/signup?username=user1&password=pw1'`
-    * Client Output:
+    Game Sessions:
+        68231 : user1 (active)
 
-            Signup successful! Welcome renzeer.
+API Server Output:
 
-    * API Server Output:
+    172.18.0.1 - - [13/Aug/2018 02:16:28] "GET /status HTTP/1.1" 200 -
 
-            127.0.0.1 - - [19/Jul/2018 20:32:10] "GET /signup?username=renzeer&password=pw123 HTTP/1.1" 200 -
+Result:  
+Use a custom /status request that prints out ingame data to retrieve the session ID tied to user1. This session ID is needed so that we can spoof the cookies on our Apache Bench commands.
 
-    * Result: Send a URL request to our API server for /signup on the mids container. This creates the user renzeer inside of our game. User data is stored as a redis entry. Upon signup, the game automatically logs you in and creates an active session.
+## while true; do docker-compose exec mids ab -n 2 -C "session_id=68231" -H "Host: user1.comcast.com" http://localhost:5000/buy/sword && docker-compose exec mids ab -n 2 -C "session_id=68231" -H "Host: user1.comcast.com" http://localhost:5000/buy/potion &&  docker-compose exec mids ab -n 2 -C "session_id=68231" -H "Host: user1.comcast.com" http://localhost:5000/buy/shield; sleep 3; done
+Client Output:
 
-* Command: `docker-compose exec mids curl http://localhost:5000/buy_sword?username=renzeer`
-    * Client Output:
+    ...
+    Document Path:          /buy/sword
+    Document Length:        16 bytes
 
-            Bought a Sword!
+    Concurrency Level:      1
+    Time taken for tests:   0.014 seconds
+    Complete requests:      2
+    Failed requests:        0
+    Total transferred:      342 bytes
+    HTML transferred:       32 bytes
+    Requests per second:    145.89 [#/sec] (mean)
+    Time per request:       6.855 [ms] (mean)
+    Time per request:       6.855 [ms] (mean, across all concurrent requests)
+    Transfer rate:          24.36 [Kbytes/sec] received
+    ...
+    Document Path:          /buy/potion
+    Document Length:        17 bytes
 
-    * API Server Output:
+    Concurrency Level:      1
+    Time taken for tests:   0.016 seconds
+    Complete requests:      2
+    Failed requests:        0
+    Total transferred:      344 bytes
+    HTML transferred:       34 bytes
+    Requests per second:    123.84 [#/sec] (mean)
+    Time per request:       8.075 [ms] (mean)
+    Time per request:       8.075 [ms] (mean, across all concurrent requests)
+    Transfer rate:          20.80 [Kbytes/sec] received
+    ...
+    Document Path:          /buy/shield
+    Document Length:        17 bytes
 
-            127.0.0.1 - - [19/Jul/2018 20:32:22] "GET /buy_sword?username=renzeer HTTP/1.1" 200 -
+    Concurrency Level:      1
+    Time taken for tests:   0.018 seconds
+    Complete requests:      2
+    Failed requests:        0
+    Total transferred:      344 bytes
+    HTML transferred:       34 bytes
+    Requests per second:    112.29 [#/sec] (mean)
+    Time per request:       8.905 [ms] (mean)
+    Time per request:       8.905 [ms] (mean, across all concurrent requests)
+    Transfer rate:          18.86 [Kbytes/sec] received
 
-    * Result: Send a URL request to our API server for /buy_sword on the mids container. Since we have now registered the username renzeer and have an active session, the action succeeds, printing a message to shell and logging an event to kafka.
+API Server Output:
 
-* Command: `docker-compose exec mids curl http://localhost:5000/join_guild?username=renzeer`
-    * Output:
+    127.0.0.1 - - [13/Aug/2018 00:23:45] "GET /buy/sword HTTP/1.0" 200 -
+    127.0.0.1 - - [13/Aug/2018 00:23:45] "GET /buy/sword HTTP/1.0" 200 -
+    127.0.0.1 - - [13/Aug/2018 00:23:46] "GET /buy/potion HTTP/1.0" 200 -
+    127.0.0.1 - - [13/Aug/2018 00:23:46] "GET /buy/potion HTTP/1.0" 200 -
+    127.0.0.1 - - [13/Aug/2018 00:23:46] "GET /buy/shield HTTP/1.0" 200 -
+    127.0.0.1 - - [13/Aug/2018 00:23:46] "GET /buy/shield HTTP/1.0" 200 -
 
-    		Joined a Guild!
+Result:  
+In an infinite loop, use Apache Bench to send multiple buy requests to our server. Include the valid session cookie for user1 in the Apache Bench requests. A change since the last version is that the item being purchased is now specified as a URL parameter. This means that user can attempt to purchase any item. However, the game's server code only accepts certain item strings as valid for purchase. For non-valid items, no event will be logged and the user will be given an appropriate message.
 
-    * API Server Output:
+## docker-compose exec mids bash -c "kafkacat -C -b kafka:29092 -t events -o beginning -e"
+Output:
 
-    		127.0.0.1 - - [19/Jul/2018 20:32:35] "GET /join_guild?username=renzeer HTTP/1.1" 200 -
+    ...
+    {"username": "user1", "event_type": "buy_item", "Accept": "*/*", "User-Agent": "ApacheBench/2.3", "item_type": "shield", "Host": "user1.comcast.com", "Cookie": "session_id=68231", "inventory": ["sword", "sword", "potion", "potion", "shield", "shield", "sword", "sword", "potion", "potion", "shield", "shield", "sword", "sword", "potion", "potion", "shield", "shield", "sword", "sword", "potion", "potion", "shield", "shield", "sword", "sword", "potion", "potion", "shield", "shield"], "item_quality": "common"}
+    {"username": "user1", "event_type": "buy_item", "Accept": "*/*", "User-Agent": "ApacheBench/2.3", "item_type": "sword", "Host": "user1.comcast.com", "Cookie": "session_id=68231", "inventory": ["sword", "sword", "potion", "potion", "shield", "shield", "sword", "sword", "potion", "potion", "shield", "shield", "sword", "sword", "potion", "potion", "shield", "shield", "sword", "sword", "potion", "potion", "shield", "shield", "sword", "sword", "potion", "potion", "shield", "shield", "sword"], "item_quality": "common"}
+    {"username": "user1", "event_type": "buy_item", "Accept": "*/*", "User-Agent": "ApacheBench/2.3", "item_type": "sword", "Host": "user1.comcast.com", "Cookie": "session_id=68231", "inventory": ["sword", "sword", "potion", "potion", "shield", "shield", "sword", "sword", "potion", "potion", "shield", "shield", "sword", "sword", "potion", "potion", "shield", "shield", "sword", "sword", "potion", "potion", "shield", "shield", "sword", "sword", "potion", "potion", "shield", "shield", "sword", "sword"], "item_quality": "common"}
+    % Reached end of topic events [0] at offset 33: exiting
 
-    * Result: Send a URL request to our API server for /join_guild on the mids container. Since our username and session is valid, the event succeeds, printing a message and logging an event to kafka
+Result:  
+Verify that the events have been logged to our events topic on our kafka server. We do this by using kafkacat on our mids container to output the contents of our topic from beginning to end. The results shows a large inventory of items from the continous stream of buy requests.
 
-* Command: `docker-compose exec mids bash -c "kafkacat -C -b kafka:29092 -t events -o beginning -e"`
-    * Output:
+## docker-compose exec spark spark-submit /w205/assignment-12-renzee-r/stream_buy_events.py
+Output:
 
-    		{"Host": "localhost:5000", "event_type": "default", "Accept": "*/*", "User-Agent": "curl/7.47.0"}
-            {"Host": "localhost:5000", "event_type": "signup", "Accept": "*/*", "User-Agent": "curl/7.47.0"}
-            {"Host": "localhost:5000", "event_type": "buy_sword", "Accept": "*/*", "User-Agent": "curl/7.47.0"}
-            {"Host": "localhost:5000", "event_type": "join_guild", "Accept": "*/*", "User-Agent": "curl/7.47.0"}
-            % Reached end of topic events [0] at offset 4: exiting
+    ...
+    18/08/13 02:18:31 INFO StreamExecution: Streaming query made progress: {
+      "id" : "65780b5a-24d3-4b4c-a239-0a643e8bfa8c",
+      "runId" : "b6de77ef-67fc-4450-8390-daa11029cdfe",
+      "name" : null,
+      "timestamp" : "2018-08-13T02:18:30.778Z",
+      "numInputRows" : 6,
+      "inputRowsPerSecond" : 0.6528835690968444,
+      "processedRowsPerSecond" : 11.450381679389313,
+      "durationMs" : {
+        "addBatch" : 320,
+        "getBatch" : 14,
+        "getOffset" : 9,
+        "queryPlanning" : 18,
+        "triggerExecution" : 524,
+        "walCommit" : 150
+      },
+      "stateOperators" : [ ],
+      "sources" : [ {
+        "description" : "KafkaSource[Subscribe[events]]",
+        "startOffset" : {
+          "events" : {
+            "0" : 85
+          }
+        },
+        "endOffset" : {
+          "events" : {
+            "0" : 91
+          }
+        },
+        "numInputRows" : 6,
+        "inputRowsPerSecond" : 0.6528835690968444,
+        "processedRowsPerSecond" : 11.450381679389313
+      } ],
+      "sink" : {
+        "description" : "FileSink[/tmp/events_buy]"
+      }
+    }
+    ...
 
-    * Result: Verify that the events have been logged to our events topic on our kafka server. We do this by using kafkacat on our mids container to output the contents of our topic from beginning to end. The results show that the first buy_sword event was not logged since we were not logged in. However, all other events have been successfully logged.
+Result:  
+Execute our spark write stream for buy events. This file will parse any buy events in our Kafka log and write them to a parquet file stored in HDFS. This job will parse all previously logged events and as Apache Bench loops, we will see those events processed in the stream file batches. Along with the data fields within the game event themselves, the spark job will also append a timestamp and the raw event data. Currently, the job is setup to process every 10 seconds.
 
-* Command: `docker-compose exec spark spark-submit /w205/assignment-11-renzee-r/extract_events.py`
-    * Output (excluding kafka config):
+## docker-compose exec cloudera hadoop fs -ls /tmp/
+Output:
 
-            18/07/19 21:44:31 INFO CodeGenerator: Code generated in 24.80991 ms
-            +------+-------------+--------------+-----------+----------+--------------------+
-            |Accept|Cache-Control|          Host| User-Agent|event_type|           timestamp|
-            +------+-------------+--------------+-----------+----------+--------------------+
-            |   */*|     no-cache|localhost:5000|curl/7.47.0|   default|2018-07-19 20:31:...|
-            |   */*|     no-cache|localhost:5000|curl/7.47.0|    signup|2018-07-19 20:32:...|
-            |   */*|     no-cache|localhost:5000|curl/7.47.0| buy_sword|2018-07-19 20:32:...|
-            |   */*|     no-cache|localhost:5000|curl/7.47.0|join_guild|2018-07-19 20:32:...|
-            +------+-------------+--------------+-----------+----------+--------------------+
+    Found 5 items
+    drwxrwxrwt   - root   supergroup          0 2018-08-13 02:18 /tmp/checkpoints_buy_events
+    drwxr-xr-x   - root   supergroup          0 2018-08-13 02:19 /tmp/events_buy
+    drwxrwxrwt   - mapred mapred              0 2016-04-06 02:26 /tmp/hadoop-yarn
+    drwx-wx-wx   - hive   supergroup          0 2018-08-13 02:16 /tmp/hive
+    drwxrwxrwt   - mapred hadoop              0 2016-04-06 02:28 /tmp/logs
 
-            ...
+Result:  
+We do a directory list of our hadoop file server to confirm that the parquet files were written out successfully. 
 
-            18/07/19 21:44:34 INFO DAGScheduler: Job 3 finished: showString at NativeMethodAccessorImpl.java:0, took 0.270423 s
-            +------+-------------+--------------+-----------+----------+--------------------+
-            |Accept|Cache-Control|          Host| User-Agent|event_type|           timestamp|
-            +------+-------------+--------------+-----------+----------+--------------------+
-            |   */*|     no-cache|localhost:5000|curl/7.47.0| buy_sword|2018-07-19 20:32:...|
-            +------+-------------+--------------+-----------+----------+--------------------+
+## docker-compose exec cloudera hive
+Output:  
+None
 
-            ...
+Result:  
+Open up the hive shell so we can establish the Hive metastore
 
-            18/07/19 21:44:35 INFO DAGScheduler: Job 5 finished: showString at NativeMethodAccessorImpl.java:0, took 0.280870 s
-            +------+-------------+--------------+-----------+----------+--------------------+
-            |Accept|Cache-Control|          Host| User-Agent|event_type|           timestamp|
-            +------+-------------+--------------+-----------+----------+--------------------+
-            |   */*|     no-cache|localhost:5000|curl/7.47.0|join_guild|2018-07-19 20:32:...|
-            +------+-------------+--------------+-----------+----------+--------------------+
+## drop table default.events_buy; create external table default.events_buy (raw_event string, Accept string, Host string, User_Agent string, event_type string, timestamp string, username string, item_type string, Cookie string, item_quality string, user_info struct<password:string, session_datetime:string, inventory:array<string>>) stored as parquet location '/tmp/events_buy' tblproperties ("parquet.compress"="SNAPPY");
 
-            ...
+Output:
 
-            18/07/19 21:44:36 INFO DAGScheduler: Job 7 finished: showString at NativeMethodAccessorImpl.java:0, took 0.263270 s
-            +------+-------------+--------------+-----------+----------+--------------------+
-            |Accept|Cache-Control|          Host| User-Agent|event_type|           timestamp|
-            +------+-------------+--------------+-----------+----------+--------------------+
-            |   */*|     no-cache|localhost:5000|curl/7.47.0|    signup|2018-07-19 20:32:...|
-            +------+-------------+--------------+-----------+----------+--------------------+
+    OK
+    Time taken: 0.505 seconds
+    OK
+    Time taken: 0.074 seconds
 
+Result:  
+Create a table called events_buy. Execute a drop statement first to clear out any exiting tables. Specify the schema to match the data fields within our buy events with the additional timestamp and raw_event fields appended. Point this table to where our write stream is outputting the parquet files for the buy events. With the table created, we can now query our data through Presto.
 
-    * Result: Submit our extraction code to spark for it to run. The code transforms the data to add the 'Cache-Control' and 'timestamp' fields. The extraction code also filters the data into 3 subsets of events; item events, guild events, and user events. The entire event log as well as these event subsets are written out to parquet.
+## docker-compose exec presto presto --server presto:8080 --catalog hive --schema default
+Output:  
+None
 
-* Command: `docker-compose exec cloudera hadoop fs -ls /tmp/`
-    * Output:
+Result:  
+Open up the presto shell so that we can start interacting with our newly created table.
 
-            Found 6 items
-            drwxr-xr-x   - root   supergroup          0 2018-07-19 21:44 /tmp/events_all
-            drwxr-xr-x   - root   supergroup          0 2018-07-19 21:44 /tmp/events_guild
-            drwxr-xr-x   - root   supergroup          0 2018-07-19 21:44 /tmp/events_item
-            drwxr-xr-x   - root   supergroup          0 2018-07-19 21:44 /tmp/events_user
-            drwxrwxrwt   - mapred mapred              0 2018-02-06 18:27 /tmp/hadoop-yarn
-            drwx-wx-wx   - root   supergroup          0 2018-07-19 20:30 /tmp/hive
+## show tables;
+Output:
 
-    * Result: We do a directory list of our hadoop file server to confirm that the parquet files were written out successfully. 
+       Table    
+    ------------
+     events_buy 
+    (1 row)
 
-* Command: `docker-compose down`
-    * Output:
+    Query 20180813_021953_00001_7qgfe, FINISHED, 1 node
+    Splits: 2 total, 2 done (100.00%)
+    0:04 [1 rows, 35B] [0 rows/s, 9B/s]
 
-    		Stopping assignment11renzeer_spark_1 ... done
-            Stopping assignment11renzeer_kafka_1 ... done
-            Stopping assignment11renzeer_zookeeper_1 ... done
-            Stopping assignment11renzeer_mids_1 ... done
-            Stopping assignment11renzeer_redis_1 ... done
-            Stopping assignment11renzeer_cloudera_1 ... done
-            Removing assignment11renzeer_spark_1 ... done
-            Removing assignment11renzeer_kafka_1 ... done
-            Removing assignment11renzeer_zookeeper_1 ... done
-            Removing assignment11renzeer_mids_1 ... done
-            Removing assignment11renzeer_redis_1 ... done
-            Removing assignment11renzeer_cloudera_1 ... done
-            Removing network assignment11renzeer_default
+Result:  
+Perform a simple `show tables` to ensure that the table was successfully created.
 
-    * Result: After we are done, we bring down all of our containers
+## describe events_buy;
+Output:
 
+        Column    |                                   Type                                    | Comment 
+    --------------+---------------------------------------------------------------------------+---------
+     raw_event    | varchar                                                                   |         
+     accept       | varchar                                                                   |         
+     host         | varchar                                                                   |         
+     user_agent   | varchar                                                                   |         
+     event_type   | varchar                                                                   |         
+     timestamp    | varchar                                                                   |         
+     username     | varchar                                                                   |         
+     item_type    | varchar                                                                   |         
+     cookie       | varchar                                                                   |         
+     item_quality | varchar                                                                   |         
+     user_info    | row(password varchar, session_datetime varchar, inventory array(varchar)) |         
+    (11 rows)
+
+    Query 20180813_023353_00023_4i9if, FINISHED, 1 node
+    Splits: 2 total, 1 done (50.00%)
+    0:00 [11 rows, 816B] [66 rows/s, 4.79KB/s]
+
+Result:  
+Describe our events_buy table to ensure that its schema matches what was specified in our create statement in Hive.
+
+## select count(*) from events_buy where item_type = 'sword';
+Output:
+
+     _col0 
+    -------
+       296 
+    (1 row)
+
+    Query 20180813_023331_00022_4i9if, FINISHED, 1 node
+    Splits: 79 total, 55 done (69.62%)
+    0:02 [616 rows, 421KB] [326 rows/s, 223KB/s]
+
+Result:  
+Perform an actual query on our dataset. Select a count of events where the item_type is equal to 'sword'. The result is a table with a single column and row containing that count.
+
+## docker-compose down
+Output:
+
+    Stopping assignment12renzeer_kafka_1 ... done
+    Stopping assignment12renzeer_spark_1 ... done
+    Stopping assignment12renzeer_redis_1 ... done
+    Stopping assignment12renzeer_presto_1 ... done
+    Stopping assignment12renzeer_mids_1 ... done
+    Stopping assignment12renzeer_zookeeper_1 ... done
+    Stopping assignment12renzeer_cloudera_1 ... done
+    Removing assignment12renzeer_kafka_1 ... done
+    Removing assignment12renzeer_spark_1 ... done
+    Removing assignment12renzeer_redis_1 ... done
+    Removing assignment12renzeer_presto_1 ... done
+    Removing assignment12renzeer_mids_1 ... done
+    Removing assignment12renzeer_zookeeper_1 ... done
+    Removing assignment12renzeer_cloudera_1 ... done
+    Removing network assignment12renzeer_default
+
+Result:  
+After we are done, we bring down all of our containers
 
 
 
