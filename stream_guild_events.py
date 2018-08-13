@@ -53,7 +53,7 @@ def main():
         .option("subscribe", "events") \
         .load()
 
-    # Create a stream for buy events
+    # Create a stream for guild events
     guild_events = raw_events \
         .filter(is_guild_event(raw_events.value.cast('string'))) \
         .select(raw_events.value.cast('string').alias('raw_event'),

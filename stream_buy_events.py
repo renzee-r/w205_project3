@@ -17,7 +17,7 @@ def buy_event_schema():
     |-- item_type: string (nullable = true)
     |-- Cookie: string (nullable = true)
     |-- item_quality: string (nullable = true)
-    |-- inventory: Struct (nullable = true)
+    |-- user_info: Struct (nullable = true)
     |-- timestamp: string (nullable = true)
     """
     return StructType([
@@ -31,6 +31,7 @@ def buy_event_schema():
         StructField("item_quality", StringType(), True),
         StructField("user_info", user_info_schema(), True),
     ])
+
 
 def user_info_schema():
     """
@@ -59,7 +60,7 @@ def main():
     """
     spark = SparkSession \
         .builder \
-        .appName("ExtractEventsJob") \
+        .appName("StreamBuyEventsJob") \
         .getOrCreate()
 
     raw_events = spark \
